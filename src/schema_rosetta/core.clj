@@ -50,32 +50,36 @@ languages can be easily supported"
   (select-keys m (for [[k v] m :when (pred v)] k)))
 
 (declare filter-result-coll)
+(declare filter-result-map)
+(declare filter-success)
+
+(defn filter-error-vals [m k v]
+  (if (coll? v)
+    (let [filtered (filter-success v)]
+      (if (empty? filtered)
+        (dissoc m k)
+        (assoc m k filtered)))
+    (dissoc m k)))
 
 (defn filter-result-map [res]
-  (reduce-kv (fn [m k v]
-               (if (instance? ProcessedError v)
-                 (assoc m k (:message v))
-                 (if (map? v)
-                   (assoc m k (filter-result-map v))
-                   (if (coll? v)
-                     (assoc m k (filter-result-coll))
-                     (dissoc m k)))))
-             (empty res)
-             res))
+  (let [m (reduce-kv filter-error-vals (empty res) res)]
+    (if (empty? m)
+      nil
+      m)))
 
 (defn filter-result-coll [res]
-  (map (fn [v]
-         (cond
-           (map? v) (filter-result-map v)
-           (coll? v) (filter-result-coll v)
-           (instance? ProcessedError v) (:message v)))
-       (filterv #(or (instance? ProcessedError %) (coll? %)) res)))
+  (let [c (map filter-success
+               (filterv #(or (instance? ProcessedError %) (coll? %)) res))]
+    (if (empty? (filter (comp not nil?) c))
+      nil
+      (into (empty res) c))))
 
 (defn filter-success [res]
   (cond
     (instance? ProcessedError res) (:message res)
     (map? res) (filter-result-map res)
-    (coll? res) (filter-result-coll res)))
+    (coll? res) (filter-result-coll res)
+    :else nil))
 
 ;; Helpers
 (defn- humanize
@@ -98,9 +102,13 @@ of that value"
       (let [result (if (instance? ProcessedError x) x (walk x))]
         (human-explain s result)))))
 
-(defn human-check
+(defn human-checker
   [input-schema]
   (comp filter-success (s/start-walker human-walker input-schema)))
+
+(defn human-check
+  [input-schema input-value]
+  ((human-checker input-schema) input-value))
 
 (defn human-walker-j
   [input-schema]
@@ -170,11 +178,13 @@ of that value"
           (print (.-value (utils/error-val result))
                  (tval ::is-not-a)
                  schema))
-        (.-value (utils/error-val result))))))
+        (.-value (utils/error-val result)))
+      result)))
 
 (extend-protocol HumanExplain
   schema.core.Predicate
   (human-explain [schema result]
+    ; (println "\n\nPREDICATE:\n" schema "\n\n" result)
     (if (utils/error? result)
       (let [err (utils/error-val result)
             [pred val] @(.-expectation-delay err)]
@@ -276,14 +286,28 @@ of that value"
 (extend-protocol HumanExplain
   clojure.lang.PersistentHashMap
   (human-explain [schema result]
-    ; (println "PersistentHashMap result: " result "\n"
-    ;          "Schema: " schema)
-    (let [m (into {} (map (fn [[schema-key schema-val] res]
-                            (human-explain (s/map-entry schema-key schema-val) res))
-                          schema result))]
+    (let [m (into {}
+                  (if (and (utils/error? result) (map? (utils/error-val result)))
+                    (map (fn [[schema-key schema-val] res]
+                           (human-explain (s/map-entry schema-key schema-val)
+                                          (utils/error [(key res) (val res)])))
+                         schema (utils/error-val result))
+                    (map (fn [[schema-key schema-val] res]
+                           (human-explain (s/map-entry schema-key schema-val) res))
+                         schema result)))]
       (if (empty? m)
         nil
         m))))
+
+(extend-protocol HumanExplain
+  clojure.lang.PersistentVector
+  (human-explain [schema result]
+    (let [v (into [] (mapv (fn [schema-val res]
+                             (human-explain schema-val res))
+                           schema result))]
+      (if (empty? v)
+        nil
+        v))))
 
 (extend-protocol HumanExplain
   schema.core.Either
@@ -292,5 +316,10 @@ of that value"
 
 (extend-protocol HumanExplain
   schema.core.Both
+  (human-explain [schema result]
+    result))
+
+(extend-protocol HumanExplain
+  schema.core.Maybe
   (human-explain [schema result]
     result))
